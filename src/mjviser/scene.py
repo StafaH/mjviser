@@ -64,6 +64,7 @@ _ARROW_HEAD = -1  # Synthetic geom type for arrow cone heads.
 _CAT_DECOR = int(mujoco.mjtCatBit.mjCAT_DECOR)
 _OBJ_TENDON = int(mujoco.mjtObj.mjOBJ_TENDON)
 _OBJ_JOINT = int(mujoco.mjtObj.mjOBJ_JOINT)
+_OBJ_FLEX = int(mujoco.mjtObj.mjOBJ_FLEX)
 
 # Cached unit meshes for decor rendering, keyed by mjtGeom int value.
 _UNIT_MESHES: dict[int, trimesh.Trimesh] = {}
@@ -127,12 +128,20 @@ class ViserMujocoScene:
     self._mjv_camera = mujoco.MjvCamera()
     # Disable all vis flags; properties below enable them on demand.
     self._mjv_option.flags[:] = 0
+    if mj_model.nflex:
+      # Match MuJoCo's default viewer: smooth flex skin where possible,
+      # falling back to edges for one-dimensional flexes.
+      self._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_FLEXEDGE] = 1
+      self._mjv_option.flags[mujoco.mjtVisFlag.mjVIS_FLEXSKIN] = 1
     self._mjv_option.frame = int(mujoco.mjtFrame.mjFRAME_NONE)
 
     # Handles.
     self._mesh_groups: list[_MeshGroup] = []
     self.site_handles_by_group: dict[tuple[int, int], viser.BatchedGlbHandle] = {}
     self._decor_handles: dict[tuple[int, bool], viser.BatchedMeshHandle] = {}
+    self._flex_face_handles: dict[int, viser.MeshHandle] = {}
+    self._flex_edge_handles: dict[int, viser.BatchedMeshHandle] = {}
+    self._flex_vert_handles: dict[int, viser.BatchedMeshHandle] = {}
     self._fixed_geom_handles: dict[tuple[int, int, int], viser.GlbHandle] = {}
     self._fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = {}
     self._update_lock = RLock()
@@ -683,6 +692,32 @@ class ViserMujocoScene:
       hull_color.on_update(_rebuild_hulls)
       hull_opacity.on_update(_rebuild_hulls)
 
+    # -- Flexes -----------------------------------------------------------
+
+    if self.mj_model.nflex:
+      with self.server.gui.add_folder("Flexes"):
+        flex_flags = [
+          ("Vertices", mujoco.mjtVisFlag.mjVIS_FLEXVERT),
+          ("Edges", mujoco.mjtVisFlag.mjVIS_FLEXEDGE),
+          ("Faces", mujoco.mjtVisFlag.mjVIS_FLEXFACE),
+          ("Smooth skin", mujoco.mjtVisFlag.mjVIS_FLEXSKIN),
+        ]
+        for label, flag in flex_flags:
+          flag_idx = int(flag)
+          cb = self.server.gui.add_checkbox(
+            label, initial_value=bool(_opt.flags[flag_idx])
+          )
+
+          @cb.on_update
+          def _(event, _idx=flag_idx) -> None:
+            self._apply_visualization_change(
+              lambda: _opt.flags.__setitem__(_idx, int(event.target.value))
+            )
+
+        max_layer = int(self.mj_model.flex_elemlayer.max(initial=0))
+        if max_layer:
+          _scale_slider("Layer", _opt, "flex_layer", 0, max_layer, 1)
+
     # -- Simple toggles ---------------------------------------------------
 
     _tendon_flag = int(mujoco.mjtVisFlag.mjVIS_TENDON)
@@ -747,6 +782,23 @@ class ViserMujocoScene:
             self._sync_visibilities()
 
           self._apply_visualization_change(_mutate)
+
+    if self.mj_model.nflex:
+      with self.server.gui.add_folder("Flexes"):
+        for i in range(6):
+          cb = self.server.gui.add_checkbox(
+            f"F{i}",
+            initial_value=bool(self._mjv_option.flexgroup[i]),
+            hint=f"Show/hide flexes in group {i}",
+          )
+
+          @cb.on_update
+          def _(event, group_idx=i) -> None:
+            self._apply_visualization_change(
+              lambda: self._mjv_option.flexgroup.__setitem__(
+                group_idx, int(event.target.value)
+              )
+            )
 
     # mjvOption group arrays for decor elements.
     _opt_groups: list[tuple[str, str]] = [
@@ -980,6 +1032,7 @@ class ViserMujocoScene:
         self._update_decor_from_mjvscene(mj_data, scene_offset)
       elif not self._any_decor_visible():
         self._clear_decor_handles()
+        self._hide_all_flex()
 
       self.server.flush()
 
@@ -1330,10 +1383,185 @@ class ViserMujocoScene:
       handle.remove()
     self._decor_handles.clear()
 
+  def _hide_all_flex(self) -> None:
+    """Hide all flex handles without discarding reusable geometry."""
+    for handles in (
+      self._flex_face_handles,
+      self._flex_edge_handles,
+      self._flex_vert_handles,
+    ):
+      for handle in handles.values():
+        handle.visible = False
+
   def _hide_all_decor(self) -> None:
     """Hide all decor handles without removing them."""
     for handle in self._decor_handles.values():
       handle.visible = False
+
+  @staticmethod
+  def _orient_z_axes(directions: np.ndarray) -> np.ndarray:
+    """Return wxyz rotations mapping +Z onto each direction."""
+    z_axes = directions / np.linalg.norm(directions, axis=1, keepdims=True)
+    helpers = np.zeros_like(z_axes)
+    helpers[:, 2] = 1.0
+    near_z = np.abs(z_axes[:, 2]) > 0.9
+    helpers[near_z] = [1.0, 0.0, 0.0]
+    x_axes = np.cross(helpers, z_axes)
+    x_axes /= np.linalg.norm(x_axes, axis=1, keepdims=True)
+    y_axes = np.cross(z_axes, x_axes)
+    matrices = np.stack((x_axes, y_axes, z_axes), axis=-1)
+    return vtf.SO3.from_matrix(matrices).wxyz.astype(np.float32)
+
+  def _update_flex_from_mjvscene(self, scene_offset: np.ndarray) -> None:
+    """Render MuJoCo's generated flex faces, edges, and vertices."""
+    active_geoms: dict[int, mujoco.MjvGeom] = {}
+    for geom_idx in range(self._mjv_scene.ngeom):
+      geom = self._mjv_scene.geoms[geom_idx]
+      if int(geom.objtype) == _OBJ_FLEX:
+        active_geoms[int(geom.objid)] = geom
+
+    active_faces: set[int] = set()
+    active_edges: set[int] = set()
+    active_verts: set[int] = set()
+    cylinder = _get_unit_mesh(_CYLINDER)
+    sphere = _get_unit_mesh(_SPHERE)
+
+    for flex_id, geom in active_geoms.items():
+      rgba = np.asarray(geom.rgba)
+      color = tuple((np.clip(rgba[:3], 0, 1) * 255).astype(np.uint8).tolist())
+      opacity = None if rgba[3] >= 1.0 else float(rgba[3])
+      name = mj_id2name(self.mj_model, mjtObj.mjOBJ_FLEX, flex_id) or str(flex_id)
+      path = f"/flex/{name}"
+
+      face_count = int(self._mjv_scene.flexfaceused[flex_id])
+      if face_count:
+        face_adr = int(self._mjv_scene.flexfaceadr[flex_id])
+        vertices = self._mjv_scene.flexface[
+          9 * face_adr : 9 * (face_adr + face_count)
+        ].reshape(-1, 3)
+        vertices = (vertices + scene_offset).astype(np.float32)
+        faces = np.arange(3 * face_count, dtype=np.uint32).reshape(-1, 3)
+        handle = self._flex_face_handles.get(flex_id)
+        if handle is None:
+          handle = self.server.scene.add_mesh_simple(
+            f"{path}/faces",
+            vertices,
+            faces,
+            color=color,
+            opacity=opacity,
+            side="double",
+            cast_shadow=False,
+            receive_shadow=False,
+          )
+          self._flex_face_handles[flex_id] = handle
+        else:
+          handle.vertices = vertices
+          if handle.faces.shape != faces.shape:
+            handle.faces = faces
+          handle.color = color
+          handle.opacity = opacity
+          handle.visible = True
+        active_faces.add(flex_id)
+
+      skin_visible = bool(self._mjv_scene.flexskinopt and face_count)
+      radius = float(geom.size[0])
+      if self._mjv_scene.flexedgeopt and not skin_visible and radius > 0:
+        edge_adr = int(self._mjv_scene.flexedgeadr[flex_id])
+        edge_count = int(self._mjv_scene.flexedgenum[flex_id])
+        vert_adr = int(self._mjv_scene.flexvertadr[flex_id])
+        edge_indices = self._mjv_scene.flexedge[
+          2 * edge_adr : 2 * (edge_adr + edge_count)
+        ].reshape(-1, 2)
+        vertices = self._mjv_scene.flexvert.reshape(-1, 3)
+        starts = vertices[vert_adr + edge_indices[:, 0]] + scene_offset
+        ends = vertices[vert_adr + edge_indices[:, 1]] + scene_offset
+        directions = ends - starts
+        lengths = np.linalg.norm(directions, axis=1)
+        valid = lengths > 1e-12
+        starts = starts[valid]
+        ends = ends[valid]
+        directions = directions[valid]
+        lengths = lengths[valid]
+        positions = ((starts + ends) * 0.5).astype(np.float32)
+        orientations = self._orient_z_axes(directions)
+        scales = np.column_stack(
+          (np.full(len(lengths), radius), np.full(len(lengths), radius), lengths)
+        ).astype(np.float32)
+        colors = np.tile(color, (len(lengths), 1))
+        opacities = (
+          None if opacity is None else np.full(len(lengths), opacity, dtype=np.float32)
+        )
+        handle = self._flex_edge_handles.get(flex_id)
+        if handle is None:
+          handle = self.server.scene.add_batched_meshes_simple(
+            f"{path}/edges",
+            cylinder.vertices,
+            cylinder.faces,
+            batched_wxyzs=orientations,
+            batched_positions=positions,
+            batched_scales=scales,
+            batched_colors=colors,
+            batched_opacities=opacities,
+            lod="off",
+            cast_shadow=False,
+            receive_shadow=False,
+          )
+          self._flex_edge_handles[flex_id] = handle
+        else:
+          handle.batched_positions = positions
+          handle.batched_wxyzs = orientations
+          handle.batched_scales = scales
+          handle.batched_colors = colors
+          handle.batched_opacities = opacities
+          handle.visible = True
+        active_edges.add(flex_id)
+
+      if self._mjv_scene.flexvertopt and not skin_visible and radius > 0:
+        vert_adr = int(self._mjv_scene.flexvertadr[flex_id])
+        vert_count = int(self._mjv_scene.flexvertnum[flex_id])
+        positions = self._mjv_scene.flexvert[
+          3 * vert_adr : 3 * (vert_adr + vert_count)
+        ].reshape(-1, 3)
+        positions = (positions + scene_offset).astype(np.float32)
+        orientations = np.tile(
+          np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (vert_count, 1)
+        )
+        scales = np.full((vert_count, 3), radius, dtype=np.float32)
+        colors = np.tile(color, (vert_count, 1))
+        opacities = (
+          None if opacity is None else np.full(vert_count, opacity, dtype=np.float32)
+        )
+        handle = self._flex_vert_handles.get(flex_id)
+        if handle is None:
+          handle = self.server.scene.add_batched_meshes_simple(
+            f"{path}/vertices",
+            sphere.vertices,
+            sphere.faces,
+            batched_wxyzs=orientations,
+            batched_positions=positions,
+            batched_scales=scales,
+            batched_colors=colors,
+            batched_opacities=opacities,
+            lod="off",
+            cast_shadow=False,
+            receive_shadow=False,
+          )
+          self._flex_vert_handles[flex_id] = handle
+        else:
+          handle.batched_positions = positions
+          handle.batched_wxyzs = orientations
+          handle.batched_scales = scales
+          handle.batched_colors = colors
+          handle.batched_opacities = opacities
+          handle.visible = True
+        active_verts.add(flex_id)
+
+    for flex_id, handle in self._flex_face_handles.items():
+      handle.visible = flex_id in active_faces
+    for flex_id, handle in self._flex_edge_handles.items():
+      handle.visible = flex_id in active_edges
+    for flex_id, handle in self._flex_vert_handles.items():
+      handle.visible = flex_id in active_verts
 
   def _update_decor_from_mjvscene(
     self, mj_data: mujoco.MjData, scene_offset: np.ndarray
@@ -1352,6 +1580,8 @@ class ViserMujocoScene:
       int(mujoco.mjtCatBit.mjCAT_ALL),
       self._mjv_scene,
     )
+
+    self._update_flex_from_mjvscene(scene_offset)
 
     # Group geoms by (type, is_tendon). Tendons are keyed separately so
     # connector-style capsules can be rendered with cylinders instead.
