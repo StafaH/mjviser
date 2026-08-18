@@ -1,0 +1,73 @@
+<!-- Copyright 2026 The MjLab Developers
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+         http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+
+<mujoco model="Flex showcase">
+  <include file="scene.xml"/>
+
+  <option timestep=".001" solver="Newton" tolerance="1e-8"
+          integrator="implicitfast"/>
+  <size memory="20M"/>
+
+  <statistic center="0 0 .9" extent="1.8"/>
+
+  <visual>
+    <map stiffness="100"/>
+  </visual>
+
+  <default>
+    <default class="anchor">
+      <geom contype="0" conaffinity="0" rgba=".25 .25 .3 1"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <!-- A one-dimensional flex starting horizontally. Gravity pulls it into
+         a visible swing around point 0, which is pinned to the world. -->
+    <flexcomp name="rope" type="grid" dim="1" count="14 1 1"
+              spacing=".08 .08 .08" pos="-1 0 1.5" radius=".018" mass=".15"
+              rgba=".9 .2 .15 1">
+      <contact selfcollide="none"/>
+      <edge equality="true" damping="2"/>
+      <pin id="0"/>
+    </flexcomp>
+    <geom name="rope_anchor" class="anchor" type="sphere"
+          pos="-1.52 0 1.5" size=".045"/>
+
+    <!-- The local XY grid starts at an angle instead of hanging at rest.
+         Pinning the final Y row makes the sheet fall and billow around its
+         upper edge. -->
+    <flexcomp name="cloth" type="grid" dim="2" count="9 9 1"
+              spacing=".09 .09 .09" pos="0 0 1.25"
+              quat=".8660254 .5 0 0" radius=".008" mass=".4"
+              rgba=".15 .45 .95 1">
+      <contact selfcollide="none"/>
+      <edge equality="true" damping="2"/>
+      <elasticity young="2e4" poisson=".2" thickness=".01"/>
+      <pin gridrange="0 8 8 8"/>
+    </flexcomp>
+    <geom name="cloth_anchor" class="anchor" type="capsule"
+          fromto="-.4 .18 1.562 .4 .18 1.562" size=".025"/>
+
+    <!-- A free volumetric flex with no pinned vertices. Its higher starting
+         position makes the impact and deformation on the ground obvious. -->
+    <flexcomp name="floppy" type="grid" dim="3" count="5 5 5"
+              spacing=".09 .09 .09" pos="1 0 1.2" radius=".008"
+              mass=".8" rgba=".2 .8 .35 1">
+      <contact condim="3" selfcollide="none"/>
+      <edge damping=".1"/>
+      <elasticity young="2e3" poisson=".2"/>
+    </flexcomp>
+  </worldbody>
+</mujoco>
