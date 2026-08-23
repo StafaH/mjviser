@@ -7,6 +7,7 @@ import trimesh.visual.material
 from mujoco import mjtGeom
 from PIL import Image
 
+import mjviser.conversions as conversions
 from mjviser.conversions import (
   _create_heightfield_mesh,
   _create_shape_mesh,
@@ -311,6 +312,27 @@ def test_merge_meshes_multiple():
 
 def test_merge_geoms(simple_model):
   mesh = merge_geoms(simple_model, [1, 2])
+  assert isinstance(mesh, trimesh.Trimesh)
+  assert len(mesh.vertices) > 0
+
+
+def test_merge_geoms_mesh(cubemap_model, monkeypatch):
+  class AsymmetricEnumValue:
+    def __init__(self, value):
+      self.value = value
+
+    def __int__(self):
+      return self.value
+
+    def __eq__(self, other):
+      return False
+
+  class AsymmetricGeomEnum:
+    mjGEOM_MESH = AsymmetricEnumValue(int(mjtGeom.mjGEOM_MESH))
+    mjGEOM_SDF = AsymmetricEnumValue(int(mjtGeom.mjGEOM_SDF))
+
+  monkeypatch.setattr(conversions, "mjtGeom", AsymmetricGeomEnum)
+  mesh = merge_geoms(cubemap_model, [0])
   assert isinstance(mesh, trimesh.Trimesh)
   assert len(mesh.vertices) > 0
 

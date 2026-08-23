@@ -582,7 +582,8 @@ def merge_geoms(mj_model: mujoco.MjModel, geom_ids: list[int]) -> trimesh.Trimes
   """Merge multiple geoms into a single trimesh in local body space."""
   meshes = []
   for geom_id in geom_ids:
-    if mj_model.geom_type[geom_id] in (mjtGeom.mjGEOM_MESH, mjtGeom.mjGEOM_SDF):
+    geom_type = int(mj_model.geom_type[geom_id])
+    if geom_type in (int(mjtGeom.mjGEOM_MESH), int(mjtGeom.mjGEOM_SDF)):
       meshes.append(mujoco_mesh_to_trimesh(mj_model, geom_id))
     else:
       meshes.append(create_primitive_mesh(mj_model, geom_id))
